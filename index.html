@@ -122,7 +122,7 @@ textarea#abc { position: absolute; left: -9999px; }
     <div class="actions">
       <button class="btn primary" id="playNotes" type="button">▶ Play the notes</button>
       <button class="btn" id="playOrig" type="button">▶ Play the recording</button>
-      <button class="btn" id="saveBtn" type="button" hidden>Save MIDI + sheet (.zip)</button>
+      <button class="btn" id="saveBtn" type="button" hidden>Save MIDI, sheet + recording (.zip)</button>
       <button class="btn" id="copyBtn" type="button">Copy ABC notation</button>
     </div>
     <textarea id="abc" aria-hidden="true" tabindex="-1"></textarea>
@@ -174,6 +174,9 @@ textarea#abc { position: absolute; left: -9999px; }
     // Tuned Nov 12, 2026 on the 40 vocadito clips (CC BY 4.0):
     // vs annotator 1: 69% notes right (50 ms, 50 cents), 76% at 100 ms, pitch found 88%
     // vs annotator 2: 62% / 70% / 95%
+    dipRatio: 0.4,       // a loudness dip below 40% of the note's peak...
+    recoverRatio: 0.7,   // ...then back above 70% starts a new note on the same pitch
+    adaptTuning: true,   // round to the singer's own tuning centre, not strict A440
     mergeGapSec: 0.03    // gaps shorter than this between same-pitch notes are closed
   };
 
@@ -280,16 +283,23 @@ textarea#abc { position: absolute; left: -9999px; }
   }
 
   // ---- 4. note splitting --------------------------------------------------
-  function splitNotes(sm, o) {
-    var dt = o.hop / TARGET_SR, notes = [], cur = null;
+  function splitNotes(sm, o, rms) {
+    var dt = o.hop / TARGET_SR, notes = [], cur = null, reart = false;
     function close() {
       if (cur) { cur.midi = median(cur.vals); notes.push(cur); cur = null; }
     }
     for (var i = 0; i < sm.length; i++) {
       var m = sm[i];
       if (cur && (isNaN(m) || Math.abs(m - median(cur.vals.slice(-15))) > o.splitSemitones)) close();
+      // re-articulation on the same pitch: loudness dips well below the note's peak, then comes back
+      if (cur && rms && o.dipRatio) {
+        var e = rms[i];
+        if (e > cur.peak) cur.peak = e;
+        if (e < cur.peak * o.dipRatio) cur.dipped = true;
+        else if (cur.dipped && e > cur.peak * o.recoverRatio && cur.vals.length * dt >= o.minNoteSec) { close(); reart = true; }
+      }
       if (!isNaN(m)) {
-        if (!cur) cur = { start: i * dt, end: i * dt + dt, vals: [m] };
+        if (!cur) { cur = { start: i * dt, end: i * dt + dt, vals: [m], peak: rms ? rms[i] : 0, dipped: false, rearticulated: reart }; reart = false; }
         else { cur.end = i * dt + dt; cur.vals.push(m); }
       }
     }
@@ -298,15 +308,22 @@ textarea#abc { position: absolute; left: -9999px; }
     var shift = o.win / 2 / TARGET_SR;
     notes.forEach(function (n) { n.start += shift; n.end += shift; });
     notes = notes.filter(function (n) { return n.end - n.start >= o.minNoteSec; });
+    // personal tuning: most people hum consistently sharp or flat of A440, so round relative to their own centre
+    var tune = 0;
+    if (o.adaptTuning && notes.length) {
+      var cx = 0, cy = 0;
+      notes.forEach(function (n) { var d = n.end - n.start, a = 2 * Math.PI * (n.midi - Math.round(n.midi)); cx += d * Math.cos(a); cy += d * Math.sin(a); });
+      tune = Math.atan2(cy, cx) / (2 * Math.PI);
+    }
     var merged = [];
     notes.forEach(function (n) {
       var p = merged[merged.length - 1];
-      if (p && n.start - p.end < o.mergeGapSec && Math.round(p.midi) === Math.round(n.midi)) {
+      if (p && n.start - p.end < o.mergeGapSec && Math.round(p.midi - tune) === Math.round(n.midi - tune) && !n.rearticulated) {
         p.end = n.end; p.vals = p.vals.concat(n.vals); p.midi = median(p.vals);
       } else merged.push(n);
     });
     return merged.map(function (n) {
-      var r = Math.round(n.midi);
+      var r = Math.round(n.midi - tune);
       return { start: n.start, end: n.end, midi: r, cents: Math.round((n.midi - r) * 100), hz: midiToHz(n.midi) };
     });
   }
@@ -316,8 +333,9 @@ textarea#abc { position: absolute; left: -9999px; }
     var x = resample(samples, sampleRate);
     var yf = yinFrames(x, o);
     var sm = pitchLine(yf, o);
-    var notes = splitNotes(sm, o);
-    return { notes: notes, pitchLine: sm, frameSec: o.hop / TARGET_SR };
+    var notes = splitNotes(sm, o, yf.rms);
+    var tuningCents = notes.length ? Math.round(notes.reduce(function (a, n) { return a + n.cents * (n.end - n.start); }, 0) / notes.reduce(function (a, n) { return a + n.end - n.start; }, 0)) : 0;
+    return { notes: notes, pitchLine: sm, frameSec: o.hop / TARGET_SR, tuningCents: tuningCents };
   }
 
   // ---- 5. helpers for display and export ----------------------------------
@@ -551,13 +569,25 @@ textarea#abc { position: absolute; left: -9999px; }
 
   var playing = null;
   function stopPlay() { if (playing) { try { playing.forEach(function (n) { n.stop(); }); } catch (e) {} playing = null; } }
+  var waveCache = null;
+  function tone(a) {
+    if (waveCache) return waveCache;
+    var amps = [0, 1, .8, .6, .45, .35, .27, .2, .15, .11, .08, .06], re = new Float32Array(amps.length), im = new Float32Array(amps);
+    waveCache = a.createPeriodicWave(re, im); return waveCache;
+  }
+  function tuningNote(r) {
+    var c = r.tuningCents || 0;
+    return Math.abs(c) >= 15 ? " You hummed about " + Math.abs(c) + " cents " + (c < 0 ? "flat" : "sharp") + " of piano tuning, so notes were matched to your own tuning." : "";
+  }
   function playNotes() {
     stopPlay(); var a = audioCtx(), t0 = a.currentTime + .05, first = state.notes[0].start, nodes = [];
     state.notes.forEach(function (n) {
       var o = a.createOscillator(), gn = a.createGain(), st = t0 + n.start - first, en = t0 + n.end - first;
-      o.type = "triangle"; o.frequency.value = HumEngine.midiToHz(n.midi);
-      gn.gain.setValueAtTime(0, st); gn.gain.linearRampToValueAtTime(.3, st + .02);
-      gn.gain.setValueAtTime(.3, Math.max(st + .02, en - .04)); gn.gain.linearRampToValueAtTime(0, en);
+      // Full harmonic series so the pitch reads correctly even on phone speakers that can't play low bass.
+      o.setPeriodicWave(tone(a)); o.frequency.value = HumEngine.midiToHz(n.midi);
+      gn.gain.setValueAtTime(0, st); gn.gain.linearRampToValueAtTime(.16, st + .015);
+      gn.gain.setTargetAtTime(.09, st + .015, .15);
+      gn.gain.setValueAtTime(.09, Math.max(st + .05, en - .05)); gn.gain.linearRampToValueAtTime(0, en);
       o.connect(gn).connect(a.destination); o.start(st); o.stop(en + .02); nodes.push(o);
     });
     playing = nodes;
@@ -580,7 +610,7 @@ textarea#abc { position: absolute; left: -9999px; }
         if (len / buf.sampleRate > 120) { setStatus("That recording is over 2 minutes. Trim it to the tune and try again.", true); return; }
         var t = performance.now();
         var r = analyse(mono, buf.sampleRate, file.name.replace(/\.[^.]+$/, "") || "Your recording");
-        setStatus(r.notes.length ? "Found " + r.notes.length + " notes in " + Math.round(performance.now() - t) + " ms." : "No clear notes in that recording. Hum louder, closer, and on “da”.", !r.notes.length);
+        setStatus(r.notes.length ? "Found " + r.notes.length + " notes in " + Math.round(performance.now() - t) + " ms." + tuningNote(r) : "No clear notes in that recording. Hum louder, closer, and on “da”.", !r.notes.length);
       };
       var fail = function () { setStatus("This browser can't read that audio format. Try WAV, MP3 or M4A.", true); };
       try { var p = a.decodeAudioData(fr.result, done, fail); if (p && p.catch) p.catch(fail); } catch (e) { fail(); }
@@ -589,6 +619,14 @@ textarea#abc { position: absolute; left: -9999px; }
     fr.readAsArrayBuffer(file);
   }
 
+  function wav(x, sr) {
+    var n = x.length, b = new ArrayBuffer(44 + n * 2), v = new DataView(b), p = 0;
+    function str(t) { for (var i = 0; i < t.length; i++) v.setUint8(p++, t.charCodeAt(i)); }
+    function u32(x) { v.setUint32(p, x, true); p += 4; } function u16(x) { v.setUint16(p, x, true); p += 2; }
+    str("RIFF"); u32(36 + n * 2); str("WAVEfmt "); u32(16); u16(1); u16(1); u32(sr); u32(sr * 2); u16(2); u16(16); str("data"); u32(n * 2);
+    for (var i = 0; i < n; i++) { var s = Math.max(-1, Math.min(1, x[i])); v.setInt16(p, s < 0 ? s * 0x8000 : s * 0x7fff, true); p += 2; }
+    return new Uint8Array(b);
+  }
   // Minimal stored (uncompressed) zip so the MIDI file can be saved.
   var CRC = (function () { var t = new Uint32Array(256); for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
   function crc32(b) { var c = 0xffffffff; for (var i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
@@ -620,7 +658,7 @@ textarea#abc { position: absolute; left: -9999px; }
     $("recBtn").classList.remove("live"); $("recTxt").textContent = "Record a hum";
     if (len < sr * 0.5) { setStatus("That was too short. Tap Record, hum, then tap Stop.", true); return; }
     var t = performance.now(), r = analyse(all, sr, "My hum");
-    setStatus(r.notes.length ? "Found " + r.notes.length + " notes in " + Math.round(performance.now() - t) + " ms." : "No clear notes heard. Hum louder, closer, and on “da”.", !r.notes.length);
+    setStatus(r.notes.length ? "Found " + r.notes.length + " notes in " + Math.round(performance.now() - t) + " ms." + tuningNote(r) : "No clear notes heard. Hum louder, closer, and on “da”.", !r.notes.length);
   }
   function startRec() {
     var a = audioCtx();
@@ -659,12 +697,12 @@ textarea#abc { position: absolute; left: -9999px; }
     if (!state.notes.length) return;
     var base = (state.name || "melody").replace(/[^\w\- ]+/g, "").trim() || "melody";
     var csv = "start_s,end_s,note,midi,cents\n" + state.notes.map(function (n) { return [n.start.toFixed(3), n.end.toFixed(3), HumEngine.noteName(n.midi), n.midi, n.cents].join(","); }).join("\n");
-    var blob = zip([{ name: base + ".mid", data: HumEngine.toMidi(state.notes, { bpm: state.bpm }) }, { name: base + ".abc", data: state.abc }, { name: base + "-notes.csv", data: csv }]);
+    var blob = zip([{ name: base + ".mid", data: HumEngine.toMidi(state.notes, { bpm: state.bpm }) }, { name: base + ".abc", data: state.abc }, { name: base + "-notes.csv", data: csv }, { name: base + "-recording.wav", data: wav(state.samples, state.sr) }]);
     if (!downloads) {
       var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = base + ".zip";
-      document.body.appendChild(a); a.click(); a.remove(); setStatus("Saved " + base + ".zip (MIDI, ABC sheet and note list)."); return;
+      document.body.appendChild(a); a.click(); a.remove(); setStatus("Saved " + base + ".zip (MIDI, sheet music, note list and your recording)."); return;
     }
-    downloads.save({ filename: base + ".zip", data: blob }).then(function () { setStatus("Saved " + base + ".zip (MIDI, ABC sheet and note list)."); })
+    downloads.save({ filename: base + ".zip", data: blob }).then(function () { setStatus("Saved " + base + ".zip (MIDI, sheet music, note list and your recording)."); })
       .catch(function (e) { if (e && e.code === "declined") return; setStatus("Saving isn't available here. Use Copy ABC notation instead.", true); });
   });
   $("copyBtn").addEventListener("click", function () {
